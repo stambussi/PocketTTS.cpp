@@ -9,7 +9,7 @@ One file (`pocket_tts.cpp`), no frameworks, no Python dependency at runtime.
 - **Single-file implementation** — all inference logic in one C++ source file
 - **CLI, HTTP server, and shared library** — built from the same source
 - **Pipelined streaming** — latent generation and audio decoding run in parallel for low latency (~96ms first chunk)
-- **Voice cloning** — clone any voice from a short WAV sample
+- **Voice cloning** — clone any voice from a short audio sample (WAV, MP3, FLAC)
 - **Two-layer disk cache** — voice embeddings (`.emb`) and transformer KV state (`.kv`) are cached to disk, making repeated use of the same voice near-instant
 - **INT8 / FP32 precision** — INT8 by default for ~4x smaller models at comparable quality
 - **Built-in profiler** — `--profile` flag for per-operation timing
@@ -80,7 +80,7 @@ cmake --build .build -j$(nproc)
 ./pocket-tts --temperature 0.5 --lsd-steps 10 "Hello." voice.wav output.wav
 ```
 
-The voice argument can be a filename in the `voices/` directory (e.g. `voice.wav`) or an absolute path to any WAV file.
+The voice argument can be a filename in the `voices/` directory (e.g. `voice.wav`) or an absolute path to any WAV, MP3, or FLAC file.
 
 ### HTTP Server
 

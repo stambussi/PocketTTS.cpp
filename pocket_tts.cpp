@@ -13,6 +13,12 @@
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 
+#define DR_MP3_IMPLEMENTATION
+#include "dr_mp3.h"
+
+#define DR_FLAC_IMPLEMENTATION
+#include "dr_flac.h"
+
 // ── Standard Library ────────────────────────────────────────────────────────
 
 #include <algorithm>
@@ -1028,10 +1034,36 @@ public:
     
     static AudioData load_audio(const std::string& path) {
         auto _ = g_prof.time("load_audio");
-        unsigned ch, sr;
-        drwav_uint64 n;
-        float* raw = drwav_open_file_and_read_pcm_frames_f32(path.c_str(), &ch, &sr, &n, nullptr);
-        if (!raw) throw std::runtime_error("Failed to load: " + path);
+        
+        // Detect format from extension
+        std::string ext;
+        size_t dot = path.rfind('.');
+        if (dot != std::string::npos) {
+            ext = path.substr(dot);
+            for (auto& c : ext) c = std::tolower((unsigned char)c);
+        }
+        
+        float* raw = nullptr;
+        unsigned ch = 0, sr = 0;
+        drwav_uint64 n = 0;
+        
+        if (ext == ".mp3") {
+            drmp3_config mp3_cfg{};
+            drmp3_uint64 mp3_n = 0;
+            raw = drmp3_open_file_and_read_pcm_frames_f32(path.c_str(), &mp3_cfg, &mp3_n, nullptr);
+            ch = mp3_cfg.channels;
+            sr = mp3_cfg.sampleRate;
+            n = mp3_n;
+        } else if (ext == ".flac" || ext == ".ogg") {
+            drflac_uint64 flac_n = 0;
+            raw = drflac_open_file_and_read_pcm_frames_f32(path.c_str(), &ch, &sr, &flac_n, nullptr);
+            n = flac_n;
+        } else {
+            // Default to WAV (handles .wav and any unknown extension)
+            raw = drwav_open_file_and_read_pcm_frames_f32(path.c_str(), &ch, &sr, &n, nullptr);
+        }
+        
+        if (!raw) throw std::runtime_error("Failed to load audio: " + path);
         
         std::vector<float> mono(n);
         for (size_t i = 0; i < n; ++i) {
@@ -1039,7 +1071,10 @@ public:
             for (unsigned c = 0; c < ch; ++c) sum += raw[i * ch + c];
             mono[i] = sum / ch;
         }
-        drwav_free(raw, nullptr);
+        
+        if (ext == ".mp3") drmp3_free(raw, nullptr);
+        else if (ext == ".flac" || ext == ".ogg") drflac_free(raw, nullptr);
+        else drwav_free(raw, nullptr);
         
         if (sr != SR) {
             auto _ = g_prof.time("resample");
