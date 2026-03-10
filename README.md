@@ -13,6 +13,7 @@ One file (`pocket_tts.cpp`), no frameworks, no Python dependency at runtime.
 - **Two-layer disk cache** — voice embeddings (`.emb`) and transformer KV state (`.kv`) are cached to disk, making repeated use of the same voice near-instant
 - **INT8 / FP32 precision** — INT8 by default for ~4x smaller models at comparable quality
 - **Built-in profiler** — `--profile` flag for per-operation timing
+- **OpenAI-compatible API** — drop-in replacement for `/v1/audio/speech` endpoint
 
 ## Requirements
 
@@ -89,10 +90,20 @@ The voice argument can be a filename in the `voices/` directory (e.g. `voice.wav
 ```
 
 Endpoints:
-- `POST /tts` — generate speech (JSON body: `{"text": "...", "voice": "..."}`)
+- `POST /v1/audio/speech` — OpenAI-compatible TTS (JSON body: `{"input": "...", "voice": "..."}`)
+- `POST /tts` — streaming TTS (JSON body: `{"text": "...", "voice": "..."}`)
 - `GET /health` — health check
 
-Audio is streamed back as chunked `audio/pcm;rate=24000;encoding=float;bits=32`.
+The `/v1/audio/speech` endpoint is compatible with the OpenAI TTS API. Any client that supports OpenAI's TTS (SillyTavern, Open WebUI, etc.) can use PocketTTS.cpp as a drop-in replacement by pointing the base URL to `http://localhost:8080`. The `model` and `speed` fields are accepted but ignored. Supported `response_format` values are `wav` (default) and `pcm`.
+
+```bash
+curl -X POST http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model": "tts-1", "input": "Hello world!", "voice": "voice", "response_format": "wav"}' \
+  --output speech.wav
+```
+
+The `/tts` endpoint streams raw chunked PCM (`audio/pcm;rate=24000;encoding=float;bits=32`) for low-latency applications.
 
 ### Shared Library (FFI)
 

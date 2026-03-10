@@ -1738,8 +1738,9 @@ public:
         
         std::cout << "TTS Server listening on http://localhost:" << port_ << "\n";
         std::cout << "Endpoints:\n";
-        std::cout << "  POST /tts          - Generate speech (JSON: {\"text\": \"...\", \"voice\": \"...\"})\n";
-        std::cout << "  GET  /health       - Health check\n";
+        std::cout << "  POST /v1/audio/speech - OpenAI-compatible TTS (JSON: {\"input\": \"...\", \"voice\": \"...\"})\n";
+        std::cout << "  POST /tts            - Streaming TTS (JSON: {\"text\": \"...\", \"voice\": \"...\"})\n";
+        std::cout << "  GET  /health         - Health check\n";
         std::cout << "Press Ctrl+C to stop\n\n";
         
         return true;
@@ -1772,12 +1773,54 @@ private:
         resp << "Content-Length: " << body.size() << "\r\n";
         resp << "Access-Control-Allow-Origin: *\r\n";
         resp << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
-        resp << "Access-Control-Allow-Headers: Content-Type\r\n";
+        resp << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
         resp << "\r\n";
         resp << body;
         
         std::string data = resp.str();
         send(fd, data.c_str(), data.size(), 0);
+    }
+    
+    void send_binary_response(int fd, const std::string& content_type, const std::vector<uint8_t>& body) {
+        std::ostringstream resp;
+        resp << "HTTP/1.1 200 OK\r\n";
+        resp << "Content-Type: " << content_type << "\r\n";
+        resp << "Content-Length: " << body.size() << "\r\n";
+        resp << "Access-Control-Allow-Origin: *\r\n";
+        resp << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+        resp << "\r\n";
+        
+        std::string header = resp.str();
+        send(fd, header.c_str(), header.size(), 0);
+        send(fd, body.data(), body.size(), 0);
+    }
+    
+    // Encode float PCM samples as a WAV file in memory
+    static std::vector<uint8_t> wav_encode(const float* samples, size_t count, int sample_rate) {
+        uint32_t data_size = count * sizeof(float);
+        uint32_t file_size = 36 + data_size;
+        
+        std::vector<uint8_t> buf(44 + data_size);
+        auto w = [&](size_t off, const void* src, size_t n) { memcpy(buf.data() + off, src, n); };
+        auto w32 = [&](size_t off, uint32_t v) { memcpy(buf.data() + off, &v, 4); };
+        auto w16 = [&](size_t off, uint16_t v) { memcpy(buf.data() + off, &v, 2); };
+        
+        w(0, "RIFF", 4);
+        w32(4, file_size);
+        w(8, "WAVE", 4);
+        w(12, "fmt ", 4);
+        w32(16, 16);                            // fmt chunk size
+        w16(20, 3);                             // IEEE float
+        w16(22, 1);                             // mono
+        w32(24, sample_rate);
+        w32(28, sample_rate * sizeof(float));   // byte rate
+        w16(32, sizeof(float));                 // block align
+        w16(34, 32);                            // bits per sample
+        w(36, "data", 4);
+        w32(40, data_size);
+        memcpy(buf.data() + 44, samples, data_size);
+        
+        return buf;
     }
     
     void send_chunked_header(int fd, const std::string& content_type) {
@@ -1863,6 +1906,55 @@ private:
                 std::cout << "  Done: " << std::fixed << std::setprecision(2) << duration << "s audio in " << elapsed << "s (RTFx: " << duration/elapsed << "x)\n";
             } catch (const std::exception& e) {
                 send_response(client_fd, 400, "application/json", "{\"error\":\"" + std::string(e.what()) + "\"}");
+            }
+        }
+        else if (req.method == "POST" && req.path == "/v1/audio/speech") {
+            // OpenAI-compatible TTS endpoint
+            // Accepts: { "model": "...", "input": "...", "voice": "...", "response_format": "wav"|"pcm" }
+            // "model" and "speed" are accepted but ignored.
+            std::string text = json_get_string(req.body, "input");
+            std::string voice = json_get_string(req.body, "voice");
+            std::string format = json_get_string(req.body, "response_format");
+            if (format.empty()) format = "wav";
+            
+            if (text.empty() || voice.empty()) {
+                send_response(client_fd, 400, "application/json", 
+                    "{\"error\":{\"message\":\"Missing 'input' or 'voice'\",\"type\":\"invalid_request_error\"}}");
+                return;
+            }
+            
+            if (format != "wav" && format != "pcm") {
+                send_response(client_fd, 400, "application/json",
+                    "{\"error\":{\"message\":\"Unsupported response_format. Use 'wav' or 'pcm'.\",\"type\":\"invalid_request_error\"}}");
+                return;
+            }
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            std::cout << "  [OpenAI] Generating: \"" << text << "\" with voice '" << voice << "' (format: " << format << ")\n";
+            
+            try {
+                AudioData audio;
+                {
+                    std::lock_guard<std::mutex> lock(tts_mutex_);
+                    audio = tts_.generate(text, voice);
+                }
+                
+                auto end = std::chrono::high_resolution_clock::now();
+                double elapsed = std::chrono::duration<double>(end - start).count();
+                double duration = audio.duration_sec();
+                std::cout << "  Done: " << std::fixed << std::setprecision(2) << duration << "s audio in " << elapsed << "s (RTFx: " << duration/elapsed << "x)\n";
+                
+                if (format == "pcm") {
+                    std::vector<uint8_t> pcm(audio.samples.size() * sizeof(float));
+                    memcpy(pcm.data(), audio.samples.data(), pcm.size());
+                    send_binary_response(client_fd, "audio/pcm", pcm);
+                } else {
+                    auto wav = wav_encode(audio.samples.data(), audio.samples.size(), PocketTTS::SR);
+                    send_binary_response(client_fd, "audio/wav", wav);
+                }
+            } catch (const std::exception& e) {
+                send_response(client_fd, 400, "application/json",
+                    "{\"error\":{\"message\":\"" + std::string(e.what()) + "\",\"type\":\"server_error\"}}");
             }
         }
         else {
