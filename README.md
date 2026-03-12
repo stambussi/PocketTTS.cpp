@@ -114,8 +114,6 @@ void*  ptt_create(const char* models_dir, const char* voices_dir,
                   const char* tokenizer_path, const char* precision,
                   float temperature, int lsd_steps, int num_threads);
 double ptt_warmup(void* handle);
-int    ptt_synthesize(void* handle, const char* text, const char* voice,
-                      float** out_samples, int* out_len, int* out_sample_rate);
 void   ptt_free_audio(float* samples);
 void   ptt_destroy(void* handle);
 

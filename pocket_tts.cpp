@@ -293,6 +293,76 @@ static std::vector<std::string> split_sentences(const std::string& text) {
     return sentences;
 }
 
+// ── Text preparation (matches Python's prepare_text_prompt) ────────────────
+
+static int count_words(const std::string& text) {
+    int count = 0;
+    bool in_word = false;
+    for (char c : text) {
+        if (std::isspace((unsigned char)c)) { in_word = false; }
+        else if (!in_word) { in_word = true; count++; }
+    }
+    return count;
+}
+
+// Prepare text for synthesis and compute frames_after_eos.
+// Returns {prepared_text, eos_extra_frames}.
+static std::pair<std::string, int> prepare_text(const std::string& raw, int cfg_eos_extra) {
+    std::string text = raw;
+    
+    // Strip characters the model can't speak
+    std::string cleaned;
+    cleaned.reserve(text.size());
+    for (char c : text) {
+        if (c == '"' || c == '`') continue;
+        cleaned += c;
+    }
+    // Strip curly double quotes (UTF-8: " ")
+    auto stripUtf8 = [](std::string& s, const char* seq) {
+        size_t len = strlen(seq);
+        size_t pos;
+        while ((pos = s.find(seq)) != std::string::npos) s.erase(pos, len);
+    };
+    stripUtf8(cleaned, "\xe2\x80\x9c");  // "
+    stripUtf8(cleaned, "\xe2\x80\x9d");  // "
+    text = cleaned;
+    
+    // Strip apostrophes/quotes from edges only (preserve contractions like don't, it's)
+    while (!text.empty() && (text.front() == '\'' || text.front() == '`')) text.erase(0, 1);
+    while (!text.empty() && (text.back() == '\'' || text.back() == '`')) text.pop_back();
+    // Curly apostrophes at edges (UTF-8: ' ')
+    while (text.size() >= 3 && text.substr(0, 3) == "\xe2\x80\x98") text.erase(0, 3);
+    while (text.size() >= 3 && text.substr(0, 3) == "\xe2\x80\x99") text.erase(0, 3);
+    while (text.size() >= 3 && text.substr(text.size() - 3) == "\xe2\x80\x98") text.erase(text.size() - 3);
+    while (text.size() >= 3 && text.substr(text.size() - 3) == "\xe2\x80\x99") text.erase(text.size() - 3);
+    
+    // Strip leading/trailing whitespace
+    size_t start = text.find_first_not_of(" \t\n\r");
+    size_t end = text.find_last_not_of(" \t\n\r");
+    if (start == std::string::npos) return {"", cfg_eos_extra >= 0 ? cfg_eos_extra : 3};
+    text = text.substr(start, end - start + 1);
+    
+    // Normalize whitespace
+    for (auto& c : text) { if (c == '\n' || c == '\r') c = ' '; }
+    
+    int nwords = count_words(text);
+    int eos_extra = cfg_eos_extra >= 0 ? cfg_eos_extra : ((nwords <= 4) ? 5 : 3);
+    
+    // Capitalize first letter
+    if (!text.empty() && std::islower((unsigned char)text[0]))
+        text[0] = std::toupper((unsigned char)text[0]);
+    
+    // Ensure ends with punctuation
+    if (!text.empty() && std::isalnum((unsigned char)text.back()))
+        text += '.';
+    
+    // Pad short text — model doesn't perform well with very few tokens
+    if (nwords < 5)
+        text = "        " + text;  // 8 spaces, matching Python
+    
+    return {text, eos_extra};
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Profiler
 // ════════════════════════════════════════════════════════════════════════════
@@ -1147,6 +1217,13 @@ public:
         
         auto a = load_audio(path);
         
+        // Truncate to 30 seconds max — matches Python, prevents OOM on long samples
+        static constexpr size_t MAX_VOICE_SAMPLES = 30 * SR;  // 720000 at 24kHz
+        if (a.samples.size() > MAX_VOICE_SAMPLES) {
+            a.samples.resize(MAX_VOICE_SAMPLES);
+            if (cfg_.verbose) std::cerr << "  Voice truncated to 30s\n";
+        }
+        
         Tensor t({1, 1, int64_t(a.samples.size())});
         std::copy(a.samples.begin(), a.samples.end(), t.data.begin());
         
@@ -1287,20 +1364,12 @@ private:
         using Snapshot = StatefulRunner::Snapshot;
         
         // Full path: voice conditioning → (optional snapshot) → text conditioning
-        LatentGen(PocketTTS& t, const Tensor& v, const TensorI64& tid, int max, Snapshot* out_voice_snap = nullptr)
-            : tts(t), max_(max), m_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
+        LatentGen(PocketTTS& t, const Tensor& v, const TensorI64& tid, int max, int eos_extra, Snapshot* out_voice_snap = nullptr)
+            : tts(t), max_(max), eos_extra_(eos_extra), m_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
               fx_(32, 0), cl_(32, std::numeric_limits<float>::quiet_NaN()),
               main_runner_(*tts.main_runner_) {
             temp_ = std::sqrt(tts.cfg_.temperature);
             flow_inputs_.reserve(4);
-            
-            // Auto-calculate eos_extra from token count if config is -1
-            if (tts.cfg_.eos_extra_frames < 0) {
-                int ntok = static_cast<int>(tid.numel());
-                eos_extra_ = std::max(2, std::min(15, ntok / 3));
-            } else {
-                eos_extra_ = tts.cfg_.eos_extra_frames;
-            }
             
             main_runner_.reinit();
             
@@ -1332,20 +1401,12 @@ private:
         }
         
         // Cached path: restore KV snapshot → text conditioning only
-        LatentGen(PocketTTS& t, const Snapshot& voice_snap, const TensorI64& tid, int max)
-            : tts(t), max_(max), m_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
+        LatentGen(PocketTTS& t, const Snapshot& voice_snap, const TensorI64& tid, int max, int eos_extra)
+            : tts(t), max_(max), eos_extra_(eos_extra), m_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
               fx_(32, 0), cl_(32, std::numeric_limits<float>::quiet_NaN()),
               main_runner_(*tts.main_runner_) {
             temp_ = std::sqrt(tts.cfg_.temperature);
             flow_inputs_.reserve(4);
-            
-            // Auto-calculate eos_extra from token count if config is -1
-            if (tts.cfg_.eos_extra_frames < 0) {
-                int ntok = static_cast<int>(tid.numel());
-                eos_extra_ = std::max(2, std::min(15, ntok / 3));
-            } else {
-                eos_extra_ = tts.cfg_.eos_extra_frames;
-            }
             
             {
                 auto _ = g_prof.time("text_conditioning");
@@ -1473,12 +1534,12 @@ private:
         return h;
     }
     
-    LatentGen make_gen(const Tensor& v, const TensorI64& t, int max) {
+    LatentGen make_gen(const Tensor& v, const TensorI64& t, int max, int eos_extra) {
         uint64_t vh = voice_hash(v);
         
         // Tier 1: in-memory cache hit
         if (voice_kv_snap_ && voice_kv_hash_ == vh) {
-            return LatentGen(*this, *voice_kv_snap_, t, max);
+            return LatentGen(*this, *voice_kv_snap_, t, max, eos_extra);
         }
         
         // Tier 2: disk cache hit
@@ -1490,13 +1551,13 @@ private:
                 main_runner_->restore_from_disk(ds);
                 voice_kv_snap_ = std::make_unique<VoiceKVSnapshot>(main_runner_->take_snapshot());
                 voice_kv_hash_ = vh;
-                return LatentGen(*this, *voice_kv_snap_, t, max);
+                return LatentGen(*this, *voice_kv_snap_, t, max, eos_extra);
             }
         }
         
         // Tier 3: full voice conditioning
         VoiceKVSnapshot snap;
-        auto gen = LatentGen(*this, v, t, max, &snap);
+        auto gen = LatentGen(*this, v, t, max, eos_extra, &snap);
         voice_kv_snap_ = std::make_unique<VoiceKVSnapshot>(std::move(snap));
         voice_kv_hash_ = vh;
         
@@ -1582,7 +1643,9 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
     if (sentences.empty()) sentences.push_back(text);
     
     for (size_t si = 0; si < sentences.size(); ++si) {
-        auto gen = make_gen(voice, tokenize(sentences[si]), max_frames);
+        auto [prepared, eos_extra] = prepare_text(sentences[si], cfg_.eos_extra_frames);
+        if (prepared.empty()) continue;
+        auto gen = make_gen(voice, tokenize(prepared), max_frames, eos_extra);
         StatefulRunner dec_runner(*dec_);
         
         // Pipelined: generator thread produces latent frames into a queue,
@@ -1617,14 +1680,11 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
         });
         
         bool first = true;
-        int total_latent_frames = 0;
-        size_t total_samples_emitted = 0;
         
         while (true) {
             int want = first ? cfg_.first_chunk_frames : cfg_.max_chunk_frames;
             
             std::vector<Tensor> batch;
-            bool is_final = false;
             {
                 std::unique_lock<std::mutex> lock(mtx);
                 cv.wait(lock, [&]{ return (int)queue.size() >= want || gen_done; });
@@ -1634,13 +1694,9 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
                     batch.push_back(std::move(queue.front()));
                     queue.pop_front();
                 }
-                is_final = gen_done && queue.empty();
             }
             
             if (batch.empty()) break;
-            
-            int batch_frames = (int)batch.size();
-            total_latent_frames += batch_frames;
             
             auto lat = Tensor::concat(batch, 1);
             std::vector<Ort::Value> inputs;
@@ -1652,17 +1708,7 @@ void PocketTTS::stream(const std::string& text, const Tensor& voice, StreamCallb
             size_t n = 1;
             for (auto d : shape) n *= d;
             
-            // Trim the final chunk: the streaming Mimi decoder may output extra
-            // samples from convolutional padding. Cap to expected total.
-            if (is_final) {
-                size_t expected_total = (size_t)total_latent_frames * 1920;
-                size_t max_this_chunk = (expected_total > total_samples_emitted) 
-                    ? expected_total - total_samples_emitted : 0;
-                if (n > max_this_chunk) n = max_this_chunk;
-            }
-            total_samples_emitted += n;
-            
-            if (n > 0 && !cb(outputs[0].GetTensorData<float>(), n)) {
+            if (!cb(outputs[0].GetTensorData<float>(), n)) {
                 std::lock_guard<std::mutex> lock(mtx);
                 aborted = true;
                 break;
@@ -2080,24 +2126,6 @@ double ptt_warmup(void* handle) {
     }
 }
 
-int ptt_synthesize(void* handle, const char* text, const char* voice,
-                   float** out_samples, int* out_len, int* out_sample_rate) {
-    if (!handle || !text || !voice || !out_samples || !out_len || !out_sample_rate) return -1;
-    try {
-        auto* tts = static_cast<pocket_tts::PocketTTS*>(handle);
-        auto audio = tts->generate(text, voice);
-        *out_sample_rate = audio.sample_rate;
-        *out_len = static_cast<int>(audio.samples.size());
-        *out_samples = static_cast<float*>(malloc(*out_len * sizeof(float)));
-        if (!*out_samples) return -2;
-        std::memcpy(*out_samples, audio.samples.data(), *out_len * sizeof(float));
-        return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "[pocket-tts] synthesize error: " << e.what() << "\n";
-        return -1;
-    }
-}
-
 void ptt_free_audio(float* samples) {
     free(samples);
 }
@@ -2107,9 +2135,6 @@ void ptt_destroy(void* handle) {
 }
 
 // ── Streaming API ───────────────────────────────────────────────────────────
-// ptt_stream_start  — kicks off generation on a background thread
-// ptt_stream_read   — blocks until next decoded chunk (or stream end)
-// ptt_stream_end    — join thread, free remaining chunks
 
 struct ptt_stream_ctx {
     std::thread thread;
