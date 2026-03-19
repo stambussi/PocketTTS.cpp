@@ -1860,10 +1860,29 @@ static std::string json_get_string(const std::string& json, const std::string& k
     pos = json.find('"', pos);
     if (pos == std::string::npos) return "";
     
-    size_t end = json.find('"', pos + 1);
-    if (end == std::string::npos) return "";
-    
-    return json.substr(pos + 1, end - pos - 1);
+    // Walk forward, unescaping JSON escape sequences and stopping at the
+    // closing (unescaped) double-quote.
+    std::string result;
+    for (size_t i = pos + 1; i < json.size(); ++i) {
+        if (json[i] == '\\' && i + 1 < json.size()) {
+            char next = json[i + 1];
+            if      (next == '"')  result += '"';
+            else if (next == '\\') result += '\\';
+            else if (next == '/')  result += '/';
+            else if (next == 'n')  result += '\n';
+            else if (next == 'r')  result += '\r';
+            else if (next == 't')  result += '\t';
+            else if (next == 'b')  result += '\b';
+            else if (next == 'f')  result += '\f';
+            else { result += '\\'; result += next; }
+            ++i;
+        } else if (json[i] == '"') {
+            break;
+        } else {
+            result += json[i];
+        }
+    }
+    return result;
 }
 
 class TTSServer {
@@ -1953,8 +1972,19 @@ public:
     }
     
 private:
-    static void ptt_send(ptt_socket_t fd, const void* data, size_t len) {
-        send(fd, static_cast<const char*>(data), static_cast<int>(len), 0);
+    static bool ptt_send(ptt_socket_t fd, const void* data, size_t len) {
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags |= MSG_NOSIGNAL;
+#endif
+        const char* ptr = static_cast<const char*>(data);
+        while (len > 0) {
+            ssize_t sent = send(fd, ptr, static_cast<int>(len), flags);
+            if (sent <= 0) return false;
+            ptr += sent;
+            len -= static_cast<size_t>(sent);
+        }
+        return true;
     }
     
     void send_response(ptt_socket_t fd, int status, const std::string& content_type, const std::string& body) {
@@ -2019,7 +2049,7 @@ private:
         return buf;
     }
     
-    void send_chunked_header(ptt_socket_t fd, const std::string& content_type) {
+    bool send_chunked_header(ptt_socket_t fd, const std::string& content_type) {
         std::ostringstream resp;
         resp << "HTTP/1.1 200 OK\r\n";
         resp << "Content-Type: " << content_type << "\r\n";
@@ -2028,19 +2058,19 @@ private:
         resp << "\r\n";
         
         std::string data = resp.str();
-        ptt_send(fd, data.c_str(), data.size());
+        return ptt_send(fd, data.c_str(), data.size());
     }
     
-    void send_chunk(ptt_socket_t fd, const void* data, size_t len) {
+    bool send_chunk(ptt_socket_t fd, const void* data, size_t len) {
         char size_buf[32];
         snprintf(size_buf, sizeof(size_buf), "%zx\r\n", len);
-        ptt_send(fd, size_buf, strlen(size_buf));
-        ptt_send(fd, data, len);
-        ptt_send(fd, "\r\n", 2);
+        if (!ptt_send(fd, size_buf, strlen(size_buf))) return false;
+        if (!ptt_send(fd, data, len)) return false;
+        return ptt_send(fd, "\r\n", 2);
     }
     
-    void send_final_chunk(ptt_socket_t fd) {
-        ptt_send(fd, "0\r\n\r\n", 5);
+    bool send_final_chunk(ptt_socket_t fd) {
+        return ptt_send(fd, "0\r\n\r\n", 5);
     }
     
     void handle_request(ptt_socket_t client_fd) {
@@ -2077,6 +2107,7 @@ private:
                 send_chunked_header(client_fd, "audio/pcm;rate=24000;encoding=float;bits=32");
                 
                 bool first_chunk = true;
+                bool client_disconnected = false;
                 size_t total_samples = 0;
                 
                 {
@@ -2088,13 +2119,20 @@ private:
                             std::cout << "  First chunk latency: " << std::fixed << std::setprecision(0) << latency << "ms\n";
                             first_chunk = false;
                         }
-                        send_chunk(client_fd, samples, n * sizeof(float));
+                        if (!send_chunk(client_fd, samples, n * sizeof(float))) {
+                            client_disconnected = true;
+                            return false; // triggers stream() abort path
+                        }
                         total_samples += n;
                         return true;
                     });
                 }
                 
-                send_final_chunk(client_fd);
+                if (client_disconnected) {
+                    std::cout << "  Client disconnected during stream\n";
+                } else {
+                    send_final_chunk(client_fd);
+                }
                 
                 auto end = std::chrono::high_resolution_clock::now();
                 double elapsed = std::chrono::duration<double>(end - start).count();
@@ -2387,6 +2425,9 @@ int main(int argc, char* argv[]) {
             
             signal(SIGINT, signal_handler);
             signal(SIGTERM, signal_handler);
+#ifndef _WIN32
+            signal(SIGPIPE, SIG_IGN);
+#endif
             
             pocket_tts::TTSServer server(tts, server_port);
             if (!server.start()) return 1;
