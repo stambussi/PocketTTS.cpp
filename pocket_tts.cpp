@@ -1134,9 +1134,11 @@ public:
             return opts;
         };
         
-        // Decoder session gets arena disabled — it's created/reset per sentence
-        // during streaming, and the arena never releases memory back to the OS,
-        // causing unbounded growth under sustained server load.
+        // Arena disabled for sessions with large or variable-size inputs that
+        // run infrequently — ORT's arena never releases memory back to the OS,
+        // so a single large allocation permanently inflates RSS.
+        //   - mimi_encoder: processes up to 720k float samples on cache miss
+        //   - mimi_decoder: reset per sentence during streaming
         auto make_opts_no_arena = [](int threads) {
             Ort::SessionOptions opts;
             opts.SetIntraOpNumThreads(threads);
@@ -1149,6 +1151,7 @@ public:
         
         auto opts_full = make_opts(threads_full);
         auto opts_ar = make_opts(threads_ar);
+        auto opts_enc = make_opts_no_arena(threads_full);
         auto opts_dec = make_opts_no_arena(threads_dec);
         
         if (cfg_.verbose) {
@@ -1168,7 +1171,7 @@ public:
         auto& env = get_ort_env();
         std::string sfx = cfg_.precision == "int8" ? "_int8" : "";
         
-        enc_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/mimi_encoder.onnx", opts_full, "mimi_encoder");
+        enc_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/mimi_encoder.onnx", opts_enc, "mimi_encoder");
         txt_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/text_conditioner.onnx", opts_full, "text_conditioner");
         main_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/flow_lm_main" + sfx + ".onnx", opts_ar, "flow_lm_main" + sfx);
         flow_ = std::make_unique<OrtSession>(env, cfg_.models_dir + "/flow_lm_flow" + sfx + ".onnx", opts_ar, "flow_lm_flow" + sfx);
@@ -1611,8 +1614,9 @@ private:
         // Tier 2: disk cache hit
         if (cfg_.voice_cache && !voice_kv_path_.empty()) {
             std::string kv_path = cache::get_cache_path(cfg_.voices_dir, voice_kv_path_, "kv");
+            std::string resolved = resolve_voice_path(voice_kv_path_);
             StateBufferIO::DiskSnapshot ds;
-            if (ds.load_from_disk(kv_path)) {
+            if (cache::is_cache_valid(resolved, kv_path) && ds.load_from_disk(kv_path)) {
                 if (cfg_.verbose) std::cerr << "  Loaded KV cache: " << kv_path << "\n";
                 main_runner_->restore_from_disk(ds);
                 voice_kv_snap_ = std::make_unique<VoiceKVSnapshot>(main_runner_->take_snapshot());
