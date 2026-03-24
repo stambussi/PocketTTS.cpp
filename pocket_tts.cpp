@@ -965,12 +965,13 @@ struct StateBufferIO {
             bool sliced = (snap.shapes[i] != init_shapes[i]) && (f32_end > f32_off);
             
             if (sliced) {
-                // Allocate full-size buffer, zero-fill, then copy sliced data into front
+                // Ensure buffer is full model size without reallocating if already correct.
+                // No need to zero the tail — the position counter state tells the model
+                // how many frames are valid, and attention masks everything beyond it.
                 size_t full_size = 1;
                 for (auto d : init_shapes[i]) full_size *= (d > 0 ? d : 1);
-                f32[b][i].assign(full_size, 0.0f);
+                f32[b][i].resize(full_size);
                 
-                // Find which dimension was sliced
                 int sd = -1;
                 for (size_t d = 0; d < init_shapes[i].size(); ++d) {
                     if (snap.shapes[i][d] != init_shapes[i][d]) { sd = (int)d; break; }
@@ -1080,10 +1081,12 @@ struct StateBufferIO {
                 bool sliced = !init_shapes.empty() && loaded_shape != init_shapes[i];
                 
                 if (sliced) {
-                    // Allocate full-size buffer, zero-fill, copy sliced data into front
+                    // Ensure buffer is full model size without reallocating if already correct.
+                    // No need to zero the tail — the position counter state tells the model
+                    // how many frames are valid, and attention masks everything beyond it.
                     size_t full_size = 1;
                     for (auto d : init_shapes[i]) full_size *= (d > 0 ? d : 1);
-                    f32[b][i].assign(full_size, 0.0f);
+                    f32[b][i].resize(full_size);
                     
                     int sd = -1;
                     for (size_t d = 0; d < init_shapes[i].size(); ++d) {
