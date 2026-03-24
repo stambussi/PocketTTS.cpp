@@ -1362,7 +1362,7 @@ private:
         return cfg_.voices_dir + "/" + p;
     }
     
-    Tensor get_voice(const std::string& p) {
+    const Tensor& get_voice(const std::string& p) {
         voice_kv_path_ = p;
         auto it = vcache_.find(p);
         if (it != vcache_.end()) return it->second;
@@ -1372,19 +1372,14 @@ private:
     }
     
     // ── Tokenization ────────────────────────────────────────────────────────
+    // Caller must pass text through prepare_text() first.
     
     TensorI64 tokenize(const std::string& text) {
         auto _ = g_prof.time("tokenize");
-        std::string t = text;
-        size_t s = t.find_first_not_of(" \t\n\r");
-        size_t e = t.find_last_not_of(" \t\n\r");
-        if (s == std::string::npos) throw std::runtime_error("Empty text");
-        t = t.substr(s, e - s + 1);
-        if (std::isalnum((unsigned char)t.back())) t += ".";
-        if (!t.empty() && std::islower((unsigned char)t[0])) t[0] = std::toupper((unsigned char)t[0]);
+        if (text.empty()) throw std::runtime_error("Empty text");
         
-        auto ids = tok_->encode(t);
-        if (cfg_.verbose) std::cerr << "  Tokens: " << ids.size() << " from " << t.size() << " chars\n";
+        auto ids = tok_->encode(text);
+        if (cfg_.verbose) std::cerr << "  Tokens: " << ids.size() << " from " << text.size() << " chars\n";
         TensorI64 r({1, int64_t(ids.size())});
         for (size_t i = 0; i < ids.size(); ++i) r.data[i] = ids[i];
         return r;
@@ -1821,8 +1816,10 @@ struct HttpRequest {
             
             size_t header_end = data.find("\r\n\r\n");
             if (header_end != std::string::npos) {
-                size_t cl_pos = data.find("Content-Length:");
-                if (cl_pos == std::string::npos) cl_pos = data.find("content-length:");
+                // Case-insensitive search for Content-Length header
+                std::string lower_data = data.substr(0, header_end);
+                for (auto& c : lower_data) c = std::tolower((unsigned char)c);
+                size_t cl_pos = lower_data.find("content-length:");
                 
                 if (cl_pos != std::string::npos) {
                     size_t cl_end = data.find("\r\n", cl_pos);
