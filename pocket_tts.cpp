@@ -1196,6 +1196,12 @@ struct StateBufferIO {
 // Combines an OrtSession with a StateBufferIO and an IoBinding to run the
 // autoregressive model efficiently. Non-state inputs are passed in per-step;
 // state inputs/outputs are managed automatically via double-buffering.
+//
+// FP16 KV caches use single-buffered mode (both input and output bound to
+// buffer 0) so ORT can do in-place ScatterElements without copying ~24MB.
+// After each run, we verify ORT actually wrote to our buffer. If it used
+// an internal temporary instead (ORT memory planner bug), we copy just the
+// newly written positions (~2KB per cache) as a correctness fallback.
 
 class StatefulRunner {
     OrtSession& sess_;
@@ -1203,11 +1209,60 @@ class StatefulRunner {
     StateBufferIO state_;
     std::unique_ptr<Ort::IoBinding> binding_;
     
+    // FP16 writeback fixup: detects when ORT ignores pre-bound output buffer
+    // and copies just the modified cache positions from ORT's temp to ours.
+    struct FP16Fixup {
+        size_t output_idx;     // position in GetOutputValues()
+        size_t state_idx;      // index in state_.f16[0]
+        size_t step_state_idx; // state index of the associated step counter
+        int64_t per_pos;       // elements per seq position (H * D)
+        int64_t capacity;      // cache seq dim
+    };
+    std::vector<FP16Fixup> fp16_fixups_;
+    
 public:
     StatefulRunner(OrtSession& sess) 
         : sess_(sess), mem_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
         state_.init(sess);
         binding_ = std::make_unique<Ort::IoBinding>(sess_.session());
+        
+        // Discover fp16 cache → step counter associations.
+        // FP16 states come in K/V pairs, each followed by an int64 step/offset.
+        struct AttnLayer { size_t k, v, step; };
+        std::vector<AttnLayer> layers;
+        for (size_t i = 0; i < state_.names.size(); ++i) {
+            if (state_.types[i] != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) continue;
+            AttnLayer l{};
+            l.k = i;
+            for (size_t j = i + 1; j < state_.names.size(); ++j)
+                if (state_.types[j] == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) { l.v = j; break; }
+            for (size_t j = l.v + 1; j < state_.names.size(); ++j)
+                if (state_.types[j] == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) { l.step = j; break; }
+            layers.push_back(l);
+            i = l.v; // skip V, already paired
+        }
+        
+        // Map state indices to output indices
+        std::unordered_map<size_t, size_t> state_to_output;
+        const auto& out_names = sess_.output_names();
+        size_t si = 0;
+        for (size_t i = 0; i < out_names.size(); ++i)
+            if (out_names[i].find("out_state_") == 0) state_to_output[si++] = i;
+        
+        // Build fixup entries for each fp16 cache
+        for (auto& l : layers) {
+            for (size_t idx : {l.k, l.v}) {
+                FP16Fixup f;
+                f.output_idx = state_to_output[idx];
+                f.state_idx = idx;
+                f.step_state_idx = l.step;
+                const auto& sh = state_.init_shapes[idx];
+                f.capacity = sh[1];
+                f.per_pos = 1;
+                for (size_t d = 2; d < sh.size(); ++d) f.per_pos *= sh[d];
+                fp16_fixups_.push_back(f);
+            }
+        }
     }
     
     StateBufferIO& state() { return state_; }
@@ -1271,6 +1326,35 @@ public:
         for (auto& [out_idx, st_idx] : dynamic_out_states) {
             state_.copy_from_output(st_idx, outputs[out_idx]);
         }
+        
+        // FP16 fixup: if ORT ignored our pre-bound buffer for ScatterElements,
+        // copy just the newly written positions from ORT's output to our buffer.
+        // When ORT honored our buffer (src == dst), this loop is a no-op.
+        for (const auto& f : fp16_fixups_) {
+            auto* ort_ptr = reinterpret_cast<const uint16_t*>(
+                outputs[f.output_idx].GetTensorData<Ort::Float16_t>());
+            auto* our_ptr = state_.f16[0][f.state_idx].data();
+            if (ort_ptr != our_ptr) {
+                // ORT used internal buffer. Copy the written positions.
+                // old_step is still in in_buf (pre-swap), new_step in out_buf.
+                int64_t old_step = state_.i64[state_.in_buf()][f.step_state_idx][0];
+                int64_t new_step = state_.i64[state_.out_buf()][f.step_state_idx][0];
+                int64_t L = new_step - old_step;
+                int64_t start = ((old_step % f.capacity) + f.capacity) % f.capacity;
+                if (start + L <= f.capacity) {
+                    std::memcpy(our_ptr + start * f.per_pos,
+                                ort_ptr + start * f.per_pos,
+                                L * f.per_pos * sizeof(uint16_t));
+                } else {
+                    int64_t first = f.capacity - start;
+                    std::memcpy(our_ptr + start * f.per_pos,
+                                ort_ptr + start * f.per_pos,
+                                first * f.per_pos * sizeof(uint16_t));
+                    std::memcpy(our_ptr, ort_ptr, (L - first) * f.per_pos * sizeof(uint16_t));
+                }
+            }
+        }
+        
         state_.swap();
         
         std::vector<Ort::Value> result;
