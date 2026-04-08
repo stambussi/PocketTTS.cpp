@@ -182,6 +182,7 @@ To disable caching entirely, pass `--no-cache`.
 | `--profile` | — | Print per-operation timing report after generation |
 | `--server` | — | Start HTTP server mode |
 | `--port` | `8080` | Server port |
+| `--interactive` | — | Interactive mode: input text to stdin, output raw f32le PCM to stdout |
 
 ## Acknowledgments
 

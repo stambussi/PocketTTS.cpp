@@ -2687,6 +2687,7 @@ int main(int argc, char* argv[]) {
     pocket_tts::Config cfg;
     bool stdout_output = false;
     bool server_mode = false;
+    bool interactive_mode = false;  // New variable for interactive mode
     int server_port = 8080;
     std::string text, voice, output;
     int pos = 0;
@@ -2700,6 +2701,7 @@ int main(int argc, char* argv[]) {
         if (a == "-h" || a == "--help") {
             std::cerr << "Usage: " << argv[0] << " [OPTIONS] TEXT VOICE [OUTPUT]\n"
                 "       " << argv[0] << " --server [OPTIONS]\n"
+                "       " << argv[0] << " --interactive [OPTIONS] VOICE\n"
                 "\nOptions:\n"
                 "  --precision <int8|fp32>  Model precision (default: int8)\n"
                 "  --temperature <float>    Sampling temperature (default: 0.7)\n"
@@ -2720,7 +2722,9 @@ int main(int argc, char* argv[]) {
                 "  --profile                Show profiling report with first-chunk latency\n"
                 "\nServer mode:\n"
                 "  --server                 Start HTTP server (models prewarmed on startup)\n"
-                "  --port <port>            Server port (default: 8080)\n";
+                "  --port <port>            Server port (default: 8080)\n"
+                "\nExtra:\n"
+                "  --interactive            Continuous input mode, process text from stdin, send output to stdout\n";  // New help entry
             return 0;
         }
         else if (a == "--precision") cfg.precision = next();
@@ -2741,11 +2745,12 @@ int main(int argc, char* argv[]) {
         else if (a == "--profile") pocket_tts::g_prof.enabled = true;
         else if (a == "--server") server_mode = true;
         else if (a == "--port") server_port = std::stoi(next());
+        else if (a == "--interactive") { interactive_mode = true; voice = next(); }// Detect interactive mode
         else if (a[0] == '-') { std::cerr << "Unknown: " << a << "\n"; return 1; }
         else { if (pos == 0) text = a; else if (pos == 1) voice = a; else if (pos == 2) output = a; pos++; }
     }
     
-    if (!server_mode) {
+    if (!server_mode && !interactive_mode) {
         if (pos < 2) { std::cerr << "Need: TEXT VOICE [OUTPUT]\n"; return 1; }
         if (pos < 3 && !stdout_output) { std::cerr << "Need OUTPUT file (or use --stdout)\n"; return 1; }
         
@@ -2783,6 +2788,32 @@ int main(int argc, char* argv[]) {
             pocket_tts::TTSServer server(tts, server_port);
             if (!server.start()) return 1;
             server.run();
+        }
+        else if (interactive_mode) {  // Handle interactive mode
+            std::string input_text;
+            double first_chunk_latency = 0;
+            while (std::getline(std::cin, input_text)) {
+                if (input_text.empty()) continue;  // Skip empty lines
+                tts.reset_profiling();
+                std::cerr << "Generating: \"" << input_text << "\" with " << voice << "\n";
+                
+                t0 = std::chrono::high_resolution_clock::now();
+                size_t total_samples = 0;
+                bool first = true;
+                
+                tts.stream(input_text, voice, [&](const float* s, size_t n) {
+                    if (first) {
+                        first_chunk_latency = std::chrono::duration<double, std::milli>(
+                            std::chrono::high_resolution_clock::now() - t0).count();
+                        first = false;
+                    }
+                    fwrite(s, sizeof(float), n, stdout);
+                    fflush(stdout);
+                    total_samples += n;
+                    return true;
+                });
+                std::cerr << "Processed input and sent audio to stdout.\n";
+            }
         }
         else {
             tts.reset_profiling();
