@@ -37,7 +37,7 @@ The included `export_onnx.py` script exports, quantizes, and validates all ONNX 
 uv venv .venv --python 3.12
 source .venv/bin/activate
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-uv pip install "pocket-tts @ git+https://github.com/kyutai-labs/pocket-tts.git"
+uv pip install pocket-tts==2.0.0
 uv pip install onnx onnxruntime
 python export_onnx.py
 ```

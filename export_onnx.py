@@ -1199,7 +1199,7 @@ def main():
     parser.add_argument("--max-seq", type=int, default=MAX_SEQ_LEN,
                         help=f"Max KV cache length for flow_lm (default: {MAX_SEQ_LEN})")
     parser.add_argument("--config", default=None,
-                        help="Path to config YAML (default: use built-in b6369a24)")
+                        help="Path to config YAML (default: use built-in english_2026-01)")
     parser.add_argument("--validate-only", action="store_true",
                         help="Skip export/quantize, only validate existing ONNX files")
     parser.add_argument("--no-validate", action="store_true",
@@ -1249,7 +1249,7 @@ def main():
 
     # Build config pointing at local weights
     import pocket_tts as _ptt
-    config_path = Path(_ptt.__file__).parent / "config" / "b6369a24.yaml"
+    config_path = Path(_ptt.__file__).parent / "config" / "english_2026-01.yaml"
     if args.config:
         config_path = Path(args.config)
     config = load_config(config_path)
